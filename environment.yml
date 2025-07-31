@@ -199,6 +199,7 @@ dependencies:
   - websocket-client=1.8.0=pyhd8ed1ab_1
   - wheel=0.45.1=pyhd8ed1ab_1
   - xgboost=3.0.2=cpu_pyhc1a9e11_0
+  - xlrd=2.0.1=pyhd8ed1ab_3
   - xorg-libxau=1.0.12=h6e16a3a_0
   - xorg-libxdmcp=1.1.5=h00291cd_0
   - yaml=0.2.5=h4132b18_3
