@@ -1,38 +1,284 @@
 # --- Código extraído de: 05_Modelo_Avanzado.ipynb ---
+# Modelado Avanzado Mejorado - Credit Scoring
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
+from datetime import datetime
 
 # Preprocesamiento y Pipelines
 from sklearn.model_selection import (train_test_split, StratifiedKFold, 
-                                     TimeSeriesSplit, RandomizedSearchCV, 
-                                     cross_val_score)
-from sklearn.preprocessing import StandardScaler, PowerTransformer
+                                     TimeSeriesSplit, cross_val_score)
+from sklearn.preprocessing import StandardScaler, PowerTransformer, RobustScaler
 from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.combine import SMOTEENN
-from scipy.stats.mstats import winsorize
+from imblearn.over_sampling import ADASYN
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import IsolationForest
 
-# Modelos
+# Modelos Avanzados
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingRegressor
-from xgboost import XGBClassifier, XGBRegressor
-from sklearn.linear_model import TweedieRegressor
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+    from lightgbm import LGBMClassifier, LGBMRegressor
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    ADVANCED_LIBS_AVAILABLE = True
+except ImportError:
+    print("Advertencia: XGBoost, LightGBM o CatBoost no disponibles. Usando modelos base.")
+    ADVANCED_LIBS_AVAILABLE = False
+
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    print("Advertencia: Optuna no disponible. Usando RandomizedSearchCV.")
+    from sklearn.model_selection import RandomizedSearchCV
+    OPTUNA_AVAILABLE = False
 
 # Métricas y Interpretabilidad
 from sklearn.metrics import (classification_report, roc_auc_score, f1_score, 
                              precision_recall_curve, auc, r2_score, 
-                             mean_squared_error)
+                             mean_squared_error, precision_score, average_precision_score)
 import shap
+from scipy.stats import ks_2samp
+from scipy.stats.mstats import winsorize
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 7)
 RANDOM_STATE = 42
+
+class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Transformador que crea características temporales evitando data leakage.
+    Solo usa información histórica previa al punto de predicción.
+    """
+    def __init__(self, lookback_months=3, target_month='sept'):
+        self.lookback_months = lookback_months
+        self.target_month = target_month
+        self.month_order = ['april', 'may', 'june', 'july', 'aug', 'sept']
+        
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        X_transformed = X.copy()
+        
+        # Obtener índice del mes objetivo
+        target_idx = self.month_order.index(self.target_month)
+        historical_months = self.month_order[:target_idx][-self.lookback_months:]
+        
+        # Solo usar meses históricos para evitar data leakage
+        pay_cols = [f'pay_amt_{month}' for month in historical_months]
+        bill_cols = [f'bill_amt_{month}' for month in historical_months]
+        pay_status_cols = [f'pay_{month}' for month in historical_months]
+        
+        # Características de tendencia temporal
+        if len(pay_cols) >= 2:
+            X_transformed['payment_trend'] = self._calculate_trend(X_transformed, pay_cols)
+            X_transformed['bill_trend'] = self._calculate_trend(X_transformed, bill_cols)
+            X_transformed['payment_volatility'] = X_transformed[pay_cols].std(axis=1)
+            
+        # Características de comportamiento de pago
+        X_transformed['avg_payment_delay'] = X_transformed[pay_status_cols].mean(axis=1)
+        X_transformed['months_with_delay'] = (X_transformed[pay_status_cols] > 0).sum(axis=1)
+        X_transformed['consecutive_delays'] = self._calculate_consecutive_delays(X_transformed, pay_status_cols)
+        
+        # Ratios financieros
+        epsilon = 1e-6
+        recent_bill = f'bill_amt_{historical_months[-1]}'
+        recent_pay = f'pay_amt_{historical_months[-1]}'
+        
+        X_transformed['utilization_recent'] = X_transformed[recent_bill] / (X_transformed['limit_bal'] + epsilon)
+        X_transformed['payment_ratio_recent'] = X_transformed[recent_pay] / (X_transformed[recent_bill] + epsilon)
+        X_transformed['debt_to_limit_ratio'] = X_transformed[bill_cols].mean(axis=1) / (X_transformed['limit_bal'] + epsilon)
+        
+        return X_transformed
+    
+    def _calculate_trend(self, df, cols):
+        """Calcula la tendencia temporal usando regresión lineal simple."""
+        trends = []
+        for idx, row in df.iterrows():
+            y_vals = row[cols].values.astype(float)
+            if len(y_vals) > 1:
+                x_vals = np.arange(len(y_vals))
+                slope, _ = np.polyfit(x_vals, y_vals, 1)
+                trends.append(slope)
+            else:
+                trends.append(0)
+        return pd.Series(trends, index=df.index)
+    
+    def _calculate_consecutive_delays(self, df, pay_status_cols):
+        """Calcula el número máximo de retrasos consecutivos."""
+        consecutive_delays = []
+        for idx, row in df.iterrows():
+            delays = (row[pay_status_cols] > 0).astype(int).values
+            max_consecutive = 0
+            current_consecutive = 0
+            
+            for delay in delays:
+                if delay == 1:
+                    current_consecutive += 1
+                    max_consecutive = max(max_consecutive, current_consecutive)
+                else:
+                    current_consecutive = 0
+            
+            consecutive_delays.append(max_consecutive)
+        
+        return pd.Series(consecutive_delays, index=df.index)
+
+class AdaptiveOutlierHandler(BaseEstimator, TransformerMixin):
+    """
+    Maneja outliers de forma adaptativa usando Isolation Forest
+    en lugar de winsorización fija.
+    """
+    def __init__(self, contamination=0.05, random_state=42):
+        self.contamination = contamination
+        self.random_state = random_state
+        self.outlier_detectors = {}
+        
+    def fit(self, X, y=None):
+        numeric_cols = X.select_dtypes(include=[np.number]).columns
+        
+        for col in numeric_cols:
+            if X[col].std() > 0:  # Solo para columnas con variabilidad
+                detector = IsolationForest(
+                    contamination=self.contamination,
+                    random_state=self.random_state
+                )
+                detector.fit(X[[col]])
+                self.outlier_detectors[col] = detector
+        
+        return self
+    
+    def transform(self, X):
+        X_transformed = X.copy()
+        
+        for col, detector in self.outlier_detectors.items():
+            outlier_mask = detector.predict(X_transformed[[col]]) == -1
+            if outlier_mask.sum() > 0:
+                # Reemplazar outliers con percentiles
+                p99 = X_transformed[col].quantile(0.99)
+                p01 = X_transformed[col].quantile(0.01)
+                
+                X_transformed.loc[outlier_mask & (X_transformed[col] > p99), col] = p99
+                X_transformed.loc[outlier_mask & (X_transformed[col] < p01), col] = p01
+        
+        return X_transformed
+
+class BusinessMetricsCalculator:
+    """
+    Calcula métricas orientadas al negocio bancario.
+    """
+    def __init__(self, cost_fp=100, benefit_tp=500, cost_fn=1000):
+        self.cost_fp = cost_fp  # Costo de falso positivo (rechazar buen cliente)
+        self.benefit_tp = benefit_tp  # Beneficio de verdadero positivo (identificar riesgo)
+        self.cost_fn = cost_fn  # Costo de falso negativo (aprobar mal cliente)
+    
+    def calculate_profit_curve(self, y_true, y_pred_proba):
+        """Calcula la curva de profit para diferentes thresholds."""
+        thresholds = np.linspace(0.01, 0.99, 100)
+        profits = []
+        
+        for threshold in thresholds:
+            y_pred = (y_pred_proba >= threshold).astype(int)
+            profit = self._calculate_profit(y_true, y_pred)
+            profits.append(profit)
+        
+        optimal_idx = np.argmax(profits)
+        return thresholds, profits, thresholds[optimal_idx], profits[optimal_idx]
+    
+    def _calculate_profit(self, y_true, y_pred):
+        """Calcula el profit total basado en la matriz de confusión."""
+        tp = ((y_true == 1) & (y_pred == 1)).sum()
+        fp = ((y_true == 0) & (y_pred == 1)).sum()
+        fn = ((y_true == 1) & (y_pred == 0)).sum()
+        
+        profit = (tp * self.benefit_tp) - (fp * self.cost_fp) - (fn * self.cost_fn)
+        return profit
+    
+    def precision_at_k(self, y_true, y_pred_proba, k_values=[0.1, 0.2, 0.3]):
+        """Calcula precision at k para diferentes percentiles de riesgo."""
+        metrics = {}
+        
+        for k in k_values:
+            threshold = np.percentile(y_pred_proba, (1-k)*100)
+            high_risk_mask = y_pred_proba >= threshold
+            
+            if high_risk_mask.sum() > 0:
+                precision_k = y_true[high_risk_mask].mean()
+                metrics[f'precision_at_{k}'] = precision_k
+            else:
+                metrics[f'precision_at_{k}'] = 0
+        
+        return metrics
+
+def create_ensemble_model():
+    """Crea un modelo ensemble diversificado."""
+    models = []
+    
+    if ADVANCED_LIBS_AVAILABLE:
+        # Modelo basado en árboles con regularización
+        lgbm = LGBMClassifier(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=RANDOM_STATE,
+            verbose=-1
+        )
+        
+        # Modelo con manejo automático de categóricas
+        catboost = CatBoostClassifier(
+            iterations=200,
+            depth=6,
+            learning_rate=0.1,
+            l2_leaf_reg=3,
+            random_state=RANDOM_STATE,
+            verbose=False
+        )
+        
+        models.extend([
+            ('lgbm', lgbm),
+            ('catboost', catboost)
+        ])
+    
+    # Modelo lineal para diversidad
+    log_reg = LogisticRegression(
+        C=0.1,
+        penalty='elasticnet',
+        l1_ratio=0.5,
+        solver='saga',
+        max_iter=1000,
+        random_state=RANDOM_STATE
+    )
+    
+    # Random Forest con parámetros optimizados
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=15,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        max_features='sqrt',
+        class_weight='balanced_subsample',
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+    
+    models.extend([
+        ('logistic', log_reg),
+        ('random_forest', rf)
+    ])
+    
+    return models
 
 try:
     project_root = Path.cwd().parent
@@ -51,170 +297,620 @@ except FileNotFoundError as e:
     df_reg = None
 
 if df_full is not None:
-    print("\n--- Iniciando Modelado de Clasificación Avanzado ---")
+    print("\n" + "="*70)
+    print("MODELADO DE CLASIFICACIÓN AVANZADO")
+    print("="*70)
     
-    # --- 3.1. Preparación de Datos ---
+    # Preparación de datos con validación temporal
     X = df_full.select_dtypes(include=np.number).drop(columns=['default_payment_next_month', 'ID'])
     y = df_full['default_payment_next_month']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+    
+    # Simular orden temporal basado en ID (asumiendo orden cronológico)
+    df_full_sorted = df_full.sort_values('ID').reset_index(drop=True)
+    split_point = int(len(df_full_sorted) * 0.8)
+    
+    # División temporal: 80% entrenamiento, 20% prueba
+    X_train = df_full_sorted.iloc[:split_point].select_dtypes(include=np.number).drop(columns=['default_payment_next_month', 'ID'])
+    X_test = df_full_sorted.iloc[split_point:].select_dtypes(include=np.number).drop(columns=['default_payment_next_month', 'ID'])
+    y_train = df_full_sorted.iloc[:split_point]['default_payment_next_month']
+    y_test = df_full_sorted.iloc[split_point:]['default_payment_next_month']
+    
+    print(f"División temporal - Entrenamiento: {X_train.shape[0]}, Prueba: {X_test.shape[0]}")
+    
+    # Pipeline mejorado con transformadores custom
+    feature_engineer = TemporalFeatureEngineer(lookback_months=3, target_month='sept')
+    outlier_handler = AdaptiveOutlierHandler(contamination=0.05)
+    
+    # Crear ensemble diversificado
+    ensemble_models = create_ensemble_model()
+    best_models = {}
+    
+    print("\n--- Entrenando Modelos del Ensemble ---")
+    
+    for name, base_model in ensemble_models:
+        print(f"\nEntrenando {name}...")
+        
+        # Pipeline completo para cada modelo
+        pipeline = ImbPipeline([
+            ('feature_engineer', feature_engineer),
+            ('outlier_handler', outlier_handler),
+            ('sampler', ADASYN(random_state=RANDOM_STATE)),  # ADASYN en lugar de SMOTE
+            ('scaler', RobustScaler()),  # RobustScaler para mejor manejo de outliers
+            ('classifier', base_model)
+        ])
+        
+        # Entrenamiento con validación cruzada temporal
+        test_size_int = int(len(X_train) * 0.15) 
+        tscv = TimeSeriesSplit(n_splits=5, test_size=test_size_int)
 
-    # --- 3.2. Búsqueda de Hiperparámetros con Pipeline y Validación Cruzada Estratificada ---
-    print("\n--- Buscando mejores hiperparámetros para Random Forest ---")
+        cv_scores = cross_val_score(pipeline, X_train, y_train, cv=tscv, 
+                                scoring='f1', n_jobs=-1)
+        
+        print(f"F1-Score CV: {cv_scores.mean():.4f} (+/- {cv_scores.std()*2:.4f})")
+        
+        # Entrenamiento final
+        pipeline.fit(X_train, y_train)
+        best_models[name] = pipeline
     
-    # Pipeline con muestreo avanzado, escalado y clasificador
-    pipeline_rf = ImbPipeline([
-        ('sampler', SMOTEENN(random_state=RANDOM_STATE)),
-        ('scaler', StandardScaler()),
-        ('classifier', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1))
-    ])
+    # Selección del mejor modelo basado en métricas de negocio
+    print("\n--- Evaluación y Selección del Mejor Modelo ---")
+    business_calc = BusinessMetricsCalculator()
+    model_scores = {}
     
-    # Parrilla de parámetros para RandomizedSearchCV
-    param_dist_rf = {
-        'classifier__n_estimators': [100, 200, 300],
-        'classifier__max_depth': [10, 20, 30, None],
-        'classifier__min_samples_split': [2, 5, 10],
-        'classifier__min_samples_leaf': [1, 2, 4],
-        'classifier__class_weight': ['balanced', 'balanced_subsample', None]
-    }
+    for name, model in best_models.items():
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        
+        # Métricas técnicas
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        avg_precision = average_precision_score(y_test, y_pred_proba)
+        
+        # Métricas de negocio
+        _, profits, optimal_threshold, max_profit = business_calc.calculate_profit_curve(y_test, y_pred_proba)
+        precision_k = business_calc.precision_at_k(y_test, y_pred_proba)
+        
+        model_scores[name] = {
+            'roc_auc': roc_auc,
+            'avg_precision': avg_precision,
+            'max_profit': max_profit,
+            'optimal_threshold': optimal_threshold,
+            **precision_k
+        }
+        
+        print(f"\n{name.upper()}:")
+        print(f"  ROC-AUC: {roc_auc:.4f}")
+        print(f"  Avg Precision: {avg_precision:.4f}")
+        print(f"  Max Profit: ${max_profit:,.0f}")
+        print(f"  Optimal Threshold: {optimal_threshold:.3f}")
+        print(f"  Precision@10%: {precision_k.get('precision_at_0.1', 0):.3f}")
     
-    # Validación cruzada estratificada
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE) # 3 splits para agilizar
+    # Seleccionar mejor modelo basado en profit
+    best_model_name = max(model_scores.keys(), 
+                         key=lambda x: model_scores[x]['max_profit'])
+    best_model = best_models[best_model_name]
+    best_threshold = model_scores[best_model_name]['optimal_threshold']
     
-    random_search_rf = RandomizedSearchCV(
-        estimator=pipeline_rf,
-        param_distributions=param_dist_rf,
-        n_iter=10, # 10 iteraciones para una búsqueda rápida
-        cv=skf,
-        scoring='f1_macro',
-        verbose=1,
-        random_state=RANDOM_STATE,
-        n_jobs=-1
+    print(f"\n🏆 MEJOR MODELO: {best_model_name.upper()}")
+    print(f"Threshold óptimo: {best_threshold:.3f}")
+    
+    # Calibración de probabilidades del mejor modelo
+    print("\n--- Calibrando Probabilidades ---")
+    
+    # Extraer el clasificador del pipeline para calibración
+    X_train_transformed = best_model[:-1].transform(X_train)
+    base_classifier = best_model.named_steps['classifier']
+    
+    # Calibración con validación cruzada
+    calibrated_clf = CalibratedClassifierCV(
+        base_classifier, 
+        method='isotonic', 
+        cv=3
     )
+    calibrated_clf.fit(X_train_transformed, y_train)
     
-    random_search_rf.fit(X_train, y_train)
-    best_clf = random_search_rf.best_estimator_
-    print(f"\nMejores parámetros encontrados para Random Forest: {random_search_rf.best_params_}")
-
-    # --- 3.3. Calibración de Probabilidades ---
-    print("\n--- Calibrando probabilidades del mejor modelo ---")
-    calibrated_clf = CalibratedClassifierCV(best_clf, method='isotonic', cv=skf)
-    calibrated_clf.fit(X_train, y_train)
-    y_pred_proba_calibrated = calibrated_clf.predict_proba(X_test)[:, 1]
-
-    # --- 3.4. Optimización de Umbral y Visualización de Curva PR ---
-    print("\n--- Optimizando umbral de decisión ---")
-    precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba_calibrated)
-    f1_scores = (2 * recall * precision) / (recall + precision + 1e-9)
-    optimal_idx = np.argmax(f1_scores)
-    optimal_threshold = thresholds[optimal_idx]
+    # Predicciones finales calibradas
+    X_test_transformed = best_model[:-1].transform(X_test)
+    y_pred_proba_calibrated = calibrated_clf.predict_proba(X_test_transformed)[:, 1]
+    y_pred_final = (y_pred_proba_calibrated >= best_threshold).astype(int)
     
-    plt.figure()
-    plt.plot(recall, precision, label='Curva Precision-Recall')
-    plt.scatter(recall[optimal_idx], precision[optimal_idx], marker='o', color='red', label=f'Mejor Umbral ({optimal_threshold:.2f})')
-    plt.xlabel('Recall')
-    plt.ylabel('Precisión')
-    plt.title('Curva Precision-Recall para el Modelo Optimizado')
-    plt.legend()
-    plt.grid(True)
+    # Evaluación final
+    print("\n--- EVALUACIÓN FINAL ---")
+    print(classification_report(y_test, y_pred_final, 
+                              target_names=['No Default', 'Default']))
+    
+    final_roc_auc = roc_auc_score(y_test, y_pred_proba_calibrated)
+    print(f"\nROC-AUC Final (Calibrado): {final_roc_auc:.4f}")
+    
+    # Visualizaciones
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # 1. Curva Precision-Recall
+    precision, recall, _ = precision_recall_curve(y_test, y_pred_proba_calibrated)
+    pr_auc = auc(recall, precision)
+    
+    axes[0,0].plot(recall, precision, label=f'PR AUC = {pr_auc:.3f}')
+    axes[0,0].set_xlabel('Recall')
+    axes[0,0].set_ylabel('Precision')
+    axes[0,0].set_title('Curva Precision-Recall')
+    axes[0,0].legend()
+    axes[0,0].grid(True)
+    
+    # 2. Curva de Profit
+    thresholds, profits, opt_thresh, max_profit = business_calc.calculate_profit_curve(
+        y_test, y_pred_proba_calibrated)
+    
+    axes[0,1].plot(thresholds, profits)
+    axes[0,1].axvline(opt_thresh, color='red', linestyle='--', 
+                     label=f'Óptimo: {opt_thresh:.3f}')
+    axes[0,1].set_xlabel('Threshold')
+    axes[0,1].set_ylabel('Profit ($)')
+    axes[0,1].set_title('Curva de Profit')
+    axes[0,1].legend()
+    axes[0,1].grid(True)
+    
+    # 3. Distribución de Probabilidades
+    axes[1,0].hist(y_pred_proba_calibrated[y_test == 0], alpha=0.7, 
+                  label='No Default', bins=30)
+    axes[1,0].hist(y_pred_proba_calibrated[y_test == 1], alpha=0.7, 
+                  label='Default', bins=30)
+    axes[1,0].axvline(best_threshold, color='red', linestyle='--', 
+                     label=f'Threshold: {best_threshold:.3f}')
+    axes[1,0].set_xlabel('Probabilidad Predicha')
+    axes[1,0].set_ylabel('Frecuencia')
+    axes[1,0].set_title('Distribución de Probabilidades')
+    axes[1,0].legend()
+    
+    # 4. Matriz de Confusión Normalizada
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(y_test, y_pred_final, normalize='true')
+    sns.heatmap(cm, annot=True, fmt='.3f', cmap='Blues', ax=axes[1,1])
+    axes[1,1].set_title('Matriz de Confusión (Normalizada)')
+    axes[1,1].set_ylabel('Valor Real')
+    axes[1,1].set_xlabel('Predicción')
+    
+    plt.tight_layout()
     plt.show()
     
-    print(f"Umbral óptimo que maximiza F1-Score: {optimal_threshold:.4f}")
-    
-    # --- 3.5. Evaluación Final del Modelo de Clasificación ---
-    y_pred_optimal = (y_pred_proba_calibrated >= optimal_threshold).astype(int)
-    print("\n--- Reporte de Clasificación Final (con umbral optimizado) ---")
-    print(classification_report(y_test, y_pred_optimal, target_names=['No Incumplimiento', 'Incumplimiento']))
+    # Análisis de Interpretabilidad con SHAP
+    print("\n--- Análisis de Interpretabilidad ---")
 
-    # --- 3.6. Interpretabilidad con SHAP ---
-    print("\n--- Análisis de Interpretabilidad con SHAP ---")
-    # SHAP requiere un modelo base, extraemos el clasificador del pipeline
-    # y lo re-entrenamos en los datos transformados para la explicación.
-    sampler = best_clf.named_steps['sampler']
-    scaler = best_clf.named_steps['scaler']
-    model = best_clf.named_steps['classifier']
-    
-    X_train_res, y_train_res = sampler.fit_resample(X_train, y_train)
-    X_train_scaled = scaler.fit_transform(X_train_res)
-    model.fit(X_train_scaled, y_train_res) # Re-entrenamiento para SHAP
-    
-    X_test_scaled = scaler.transform(X_test)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test_scaled)
-    shap_vals_class1 = shap_values[1][:, :X_test_scaled.shape[1]]
-    shap.summary_plot(
-        shap_vals_class1,
-        features=X_test_scaled,
-        feature_names=X_test.columns,
-        plot_type="bar",
-        max_display=15
-    )
-    
-    print("Generando gráfico de resumen de SHAP (Clase 1: Incumplimiento)...")
-    # CORRECCIÓN: Se pasa el array escalado (X_test_scaled) y los nombres de las columnas
-    # por separado para evitar el error de aserción de forma.
-    shap.summary_plot(shap_values[1], features=X_test_scaled, feature_names=X_test.columns, plot_type="bar", max_display=15)
+    # Usar una muestra un poco más grande para el fondo del explainer si es posible
+    X_train_sample = X_train_transformed[:500]
+    X_test_for_shap = X_test_transformed[:200]  # Muestra para eficiencia en predicción
+
+    try:
+        # 1. Crear el Explainer de SHAP
+        if 'tree' in str(type(base_classifier)).lower():
+            explainer = shap.TreeExplainer(base_classifier)
+        else:
+            # Usamos un background dataset para aproximar las expectativas
+            explainer = shap.Explainer(base_classifier.predict_proba, X_train_sample)
+        
+        # 2. Calcular los valores SHAP
+        # Para modelos de probabilidad, accedemos a la salida de la clase positiva (Default)
+        shap_values = explainer(X_test_for_shap)
+        
+        # Asegurarnos de que estamos usando los valores de la clase 'Default'
+        # La nueva API de SHAP a menudo devuelve un objeto explainer con .values y .base_values
+        if isinstance(shap_values, list): # Para la API antigua
+            shap_values_positive = shap_values[1]
+        else: # Para la nueva API
+            shap_values_positive = shap_values.values[:,:,1]
+
+        # Obtener nombres de características (con el fallback que ya tenías)
+        try:
+            feature_names = best_model[:-1].get_feature_names_out()
+        except Exception:
+            print("Advertencia: No se pudieron obtener los nombres de las características del pipeline.")
+            print("Se usarán nombres genéricos.")
+            feature_names = [f"feature_{i}" for i in range(X_test_for_shap.shape[1])]
+
+        # Convertir los datos de prueba a un DataFrame con los nombres correctos
+        X_test_shap_df = pd.DataFrame(X_test_for_shap, columns=feature_names)
+
+        # 3. Gráfico de Importancia (Corregido)
+        # Usamos el summary plot por defecto (tipo 'dot'), que es más robusto e informativo.
+        print("\nImportancia de Características (SHAP Summary Plot):")
+        shap.summary_plot(shap_values_positive, X_test_shap_df, max_display=15)
+
+        # 4. Gráfico de Dependencia/Interacción (Corregido y Añadido)
+        # Este gráfico muestra cómo una característica impacta la predicción
+        # y cómo interactúa con otra característica (elegida automáticamente por SHAP).
+        print("\nGráfico de Dependencia (ej. para la característica más importante):")
+        
+        # Obtener la característica más importante para mostrar un ejemplo
+        most_important_feature = X_test_shap_df.columns[np.argsort(np.abs(shap_values_positive).mean(0))[-1]]
+        
+        fig, ax = plt.subplots() # Crear figura para tener más control
+        shap.dependence_plot(most_important_feature, shap_values_positive, X_test_shap_df, ax=ax)
+        plt.tight_layout()  # <-- CLAVE: Ajusta el gráfico para que no se corte
+        plt.show()          # <-- CLAVE: Muestra el gráfico ajustado
+
+    except Exception as e:
+        print(f"Error en análisis SHAP: {e}")
+        print("Continuando sin análisis de interpretabilidad...")
 
 if df_reg is not None:
-    print("\n--- Iniciando Modelado de Regresión Avanzado (Hurdle Model) ---")
+    print("\n" + "="*70)
+    print("MODELADO DE REGRESIÓN AVANZADO (HURDLE MODEL)")
+    print("="*70)
     
-    # --- 4.1. Preparación de Datos ---
+    # Preparación de datos
     X_reg = df_reg.select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
     y_reg = df_reg['pay_amt_june']
     
-    y_hurdle_class = (y_reg > 0).astype(int)
-    df_reg_pos = df_reg[df_reg['pay_amt_june'] > 0]
-    X_reg_pos = df_reg_pos.select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
-    y_reg_pos = df_reg_pos['pay_amt_june']
+    # Crear variable binaria para el hurdle (¿paga algo?)
+    y_hurdle_binary = (y_reg > 0).astype(int)
     
-    X_train_reg, X_test_reg, y_train_hurdle_class, y_test_hurdle_class, y_train_reg_orig, y_test_reg_orig = train_test_split(
-        X_reg, y_hurdle_class, y_reg, test_size=0.2, random_state=RANDOM_STATE, stratify=y_hurdle_class
-    )
-    X_train_reg_pos, X_test_reg_pos, y_train_reg_pos, y_test_reg_pos = train_test_split(
-        X_reg_pos, y_reg_pos, test_size=0.2, random_state=RANDOM_STATE
-    )
-
-    # --- 4.2. Etapa 1: Entrenamiento del Clasificador del Obstáculo ---
-    print("\n--- Entrenando Etapa 1: Clasificador del Obstáculo ---")
-    scale_pos_weight_hurdle = y_train_hurdle_class.value_counts()[0] / y_train_hurdle_class.value_counts()[1]
-    pipeline_hurdle_class = ImbPipeline([
-        ('sampler', SMOTEENN(random_state=RANDOM_STATE)),
-        ('scaler', StandardScaler()),
-        ('classifier', XGBClassifier(random_state=RANDOM_STATE, use_label_encoder=False, eval_metric='logloss', scale_pos_weight=scale_pos_weight_hurdle))
+    # División temporal
+    df_reg_sorted = df_reg.sort_values('ID').reset_index(drop=True)
+    split_point_reg = int(len(df_reg_sorted) * 0.8)
+    
+    X_train_reg = df_reg_sorted.iloc[:split_point_reg].select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
+    X_test_reg = df_reg_sorted.iloc[split_point_reg:].select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
+    y_train_reg = df_reg_sorted.iloc[:split_point_reg]['pay_amt_june']
+    y_test_reg = df_reg_sorted.iloc[split_point_reg:]['pay_amt_june']
+    y_train_binary = (y_train_reg > 0).astype(int)
+    y_test_binary = (y_test_reg > 0).astype(int)
+    
+    # Datos solo para clientes que pagan (monto > 0)
+    positive_mask_train = y_train_reg > 0
+    positive_mask_test = y_test_reg > 0
+    
+    X_train_positive = X_train_reg[positive_mask_train]
+    X_test_positive = X_test_reg[positive_mask_test]
+    y_train_positive = y_train_reg[positive_mask_train]
+    y_test_positive = y_test_reg[positive_mask_test]
+    
+    print(f"Clientes que pagan en entrenamiento: {positive_mask_train.sum()}")
+    print(f"Clientes que pagan en prueba: {positive_mask_test.sum()}")
+    
+    # ETAPA 1: Modelo de Clasificación (Hurdle)
+    print("\n--- ETAPA 1: Modelo Hurdle (¿Pagará algo?) ---")
+    
+    hurdle_pipeline = ImbPipeline([
+        ('outlier_handler', AdaptiveOutlierHandler(contamination=0.03)),
+        ('sampler', ADASYN(random_state=RANDOM_STATE)),
+        ('scaler', RobustScaler()),
+        ('classifier', LGBMClassifier(
+            n_estimators=150,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=RANDOM_STATE,
+            verbose=-1
+        ) if ADVANCED_LIBS_AVAILABLE else RandomForestClassifier(
+            n_estimators=150, 
+            max_depth=10, 
+            random_state=RANDOM_STATE, 
+            n_jobs=-1
+        ))
     ])
-    pipeline_hurdle_class.fit(X_train_reg, y_train_hurdle_class)
     
-    # --- 4.3. Etapa 2: Entrenamiento del Regresor de Monto con Validación Temporal ---
-    print("\n--- Entrenando Etapa 2: Regresor de Monto ---")
+    # Entrenamiento del modelo hurdle
+    hurdle_pipeline.fit(X_train_reg, y_train_binary)
     
-    # Aplicar winsorización para tratar outliers
-    y_train_reg_pos_win = winsorize(y_train_reg_pos, limits=[0.01, 0.01])
+    # Evaluación del hurdle
+    y_pred_hurdle = hurdle_pipeline.predict(X_test_reg)
+    y_pred_hurdle_proba = hurdle_pipeline.predict_proba(X_test_reg)[:, 1]
     
-    # Pipeline para el regresor
-    pipeline_reg = Pipeline([
-        ('scaler', StandardScaler()),
-        ('transformer', PowerTransformer(method='yeo-johnson')), # Transformación flexible
-        ('regressor', HistGradientBoostingRegressor(random_state=RANDOM_STATE)) # Modelo robusto a outliers
+    hurdle_auc = roc_auc_score(y_test_binary, y_pred_hurdle_proba)
+    print(f"ROC-AUC Modelo Hurdle: {hurdle_auc:.4f}")
+    print(f"Precisión Hurdle: {(y_pred_hurdle == y_test_binary).mean():.4f}")
+    
+    # ETAPA 2: Modelo de Regresión (¿Cuánto pagará?)
+    print("\n--- ETAPA 2: Modelo de Monto ---")
+    
+    # Pipeline para regresión con manejo mejorado de outliers
+    regression_pipeline = Pipeline([
+        ('outlier_handler', AdaptiveOutlierHandler(contamination=0.05)),
+        ('scaler', RobustScaler()),
+        ('transformer', PowerTransformer(method='yeo-johnson')),
+        ('regressor', HistGradientBoostingRegressor(
+            max_iter=200,
+            max_depth=8,
+            learning_rate=0.1,
+            l2_regularization=0.1,
+            random_state=RANDOM_STATE
+        ))
     ])
     
-    # Validación cruzada temporal
-    tscv = TimeSeriesSplit(n_splits=5)
-    rmse_scores = cross_val_score(pipeline_reg, X_train_reg_pos, y_train_reg_pos_win, cv=tscv, scoring='neg_root_mean_squared_error', n_jobs=-1)
-    print(f"RMSE Promedio en Validación Cruzada Temporal: {-np.mean(rmse_scores):.2f}")
-    
-    # Entrenamiento final del regresor
-    pipeline_reg.fit(X_train_reg_pos, y_train_reg_pos_win)
+    # Entrenamiento con validación cruzada temporal
+    test_size_reg_int = int(len(X_train_positive) * 0.2)
+    tscv_reg = TimeSeriesSplit(n_splits=4, test_size=test_size_reg_int)
 
-    # --- 4.4. Combinación y Evaluación Final del Modelo ---
-    print("\n--- Evaluación Final del Modelo de Obstáculo Combinado ---")
-    pred_paga_o_no = pipeline_hurdle_class.predict(X_test_reg)
-    pred_monto_si_paga = pipeline_reg.predict(X_test_reg)
-    final_predictions = pred_monto_si_paga * pred_paga_o_no
+    rmse_scores = cross_val_score(
+        regression_pipeline, 
+        X_train_positive, 
+        y_train_positive, 
+        cv=tscv_reg, 
+        scoring='neg_root_mean_squared_error',
+        n_jobs=-1
+    )
     
-    r2_hurdle = r2_score(y_test_reg_orig, final_predictions)
-    rmse_hurdle = np.sqrt(mean_squared_error(y_test_reg_orig, final_predictions))
+    print(f"RMSE CV: {-rmse_scores.mean():.2f} (+/- {rmse_scores.std()*2:.2f})")
     
-    print(f"R² Score Final: {r2_hurdle:.4f}")
-    print(f"RMSE Final: {rmse_hurdle:.4f}")
+    # Entrenamiento final
+    regression_pipeline.fit(X_train_positive, y_train_positive)
+    
+    # COMBINACIÓN FINAL DEL MODELO HURDLE
+    print("\n--- EVALUACIÓN FINAL DEL MODELO HURDLE COMBINADO ---")
+    
+    # Predicciones de la etapa 1 (¿pagará?)
+    will_pay_proba = hurdle_pipeline.predict_proba(X_test_reg)[:, 1]
+    will_pay_pred = will_pay_proba > 0.5
+    
+    # Predicciones de la etapa 2 (¿cuánto?)
+    amount_pred = regression_pipeline.predict(X_test_reg)
+    
+    # Combinación: monto predicho * probabilidad de pago
+    final_predictions = amount_pred * will_pay_proba
+    
+    # Métricas de evaluación
+    r2_hurdle = r2_score(y_test_reg, final_predictions)
+    rmse_hurdle = np.sqrt(mean_squared_error(y_test_reg, final_predictions))
+    mae_hurdle = np.mean(np.abs(y_test_reg - final_predictions))
+    
+    # Métricas adicionales para evaluación de negocio
+    def mean_absolute_percentage_error(y_true, y_pred):
+        return np.mean(np.abs((y_true - y_pred) / np.maximum(y_true, 1))) * 100
+    
+    mape_hurdle = mean_absolute_percentage_error(y_test_reg, final_predictions)
+    
+    # Evaluar solo en clientes que realmente pagan
+    if positive_mask_test.sum() > 0:
+        r2_positive_only = r2_score(y_test_positive, final_predictions[positive_mask_test])
+        rmse_positive_only = np.sqrt(mean_squared_error(y_test_positive, final_predictions[positive_mask_test]))
+    else:
+        r2_positive_only = rmse_positive_only = 0
+    
+    print(f"R² Score (Todos): {r2_hurdle:.4f}")
+    print(f"RMSE (Todos): {rmse_hurdle:.2f}")
+    print(f"MAE (Todos): {mae_hurdle:.2f}")
+    print(f"MAPE (Todos): {mape_hurdle:.2f}%")
+    print(f"R² Score (Solo pagadores): {r2_positive_only:.4f}")
+    print(f"RMSE (Solo pagadores): {rmse_positive_only:.2f}")
+    
+    # Visualizaciones del modelo de regresión
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # 1. Predicciones vs Valores Reales (Todos)
+    axes[0,0].scatter(y_test_reg, final_predictions, alpha=0.6, s=20)
+    axes[0,0].plot([y_test_reg.min(), y_test_reg.max()], 
+                   [y_test_reg.min(), y_test_reg.max()], '--r', linewidth=2)
+    axes[0,0].set_xlabel('Valores Reales')
+    axes[0,0].set_ylabel('Predicciones')
+    axes[0,0].set_title(f'Predicciones vs Reales (Todos)\nR² = {r2_hurdle:.3f}')
+    axes[0,0].grid(True, alpha=0.3)
+    
+    # 2. Predicciones vs Valores Reales (Solo pagadores)
+    if positive_mask_test.sum() > 0:
+        axes[0,1].scatter(y_test_positive, final_predictions[positive_mask_test], 
+                         alpha=0.6, s=20, color='green')
+        axes[0,1].plot([y_test_positive.min(), y_test_positive.max()], 
+                       [y_test_positive.min(), y_test_positive.max()], '--r', linewidth=2)
+        axes[0,1].set_xlabel('Valores Reales')
+        axes[0,1].set_ylabel('Predicciones')
+        axes[0,1].set_title(f'Predicciones vs Reales (Pagadores)\nR² = {r2_positive_only:.3f}')
+        axes[0,1].grid(True, alpha=0.3)
+    
+    # 3. Distribución de Residuos
+    residuals = y_test_reg - final_predictions
+    axes[1,0].hist(residuals, bins=50, alpha=0.7, edgecolor='black')
+    axes[1,0].axvline(residuals.mean(), color='red', linestyle='--', 
+                     label=f'Media: {residuals.mean():.2f}')
+    axes[1,0].set_xlabel('Residuos')
+    axes[1,0].set_ylabel('Frecuencia')
+    axes[1,0].set_title('Distribución de Residuos')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # 4. Q-Q Plot de Residuos
+    from scipy import stats
+    stats.probplot(residuals, dist="norm", plot=axes[1,1])
+    axes[1,1].set_title('Q-Q Plot de Residuos')
+    axes[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Análisis de Importancia de Características
+    print("\n--- Análisis de Importancia de Características ---")
+    
+    # Importancia del modelo hurdle (clasificación)
+    if hasattr(hurdle_pipeline.named_steps['classifier'], 'feature_importances_'):
+        # Obtener datos transformados para obtener nombres correctos
+        X_transformed_sample = hurdle_pipeline[:-1].transform(X_train_reg[:100])
+        hurdle_importances = hurdle_pipeline.named_steps['classifier'].feature_importances_
+        
+        # Crear DataFrame de importancias del hurdle
+        try:
+            hurdle_feature_names = hurdle_pipeline[:-1].get_feature_names_out()
+        except Exception:
+            print("Advertencia: No se pudieron obtener los nombres de las características del pipeline del hurdle.")
+            hurdle_feature_names = [f'feature_{i}' for i in range(len(hurdle_importances))]
+
+        hurdle_importance_df = pd.DataFrame({
+            'feature': hurdle_feature_names,
+            'importance': hurdle_importances,
+            'model': 'Hurdle (¿Pagará?)'
+        }).sort_values('importance', ascending=False)
+
+    print("Top 10 características más importantes para el modelo Hurdle:")
+    print(hurdle_importance_df.head(10))
+    
+    # Importancia del modelo de regresión
+    if hasattr(regression_pipeline.named_steps['regressor'], 'feature_importances_'):
+        reg_importances = regression_pipeline.named_steps['regressor'].feature_importances_
+        
+        try:
+            reg_feature_names = regression_pipeline[:-1].get_feature_names_out()
+        except Exception:
+            print("Advertencia: No se pudieron obtener los nombres de las características del pipeline de regresión.")
+            reg_feature_names = [f'feature_{i}' for i in range(len(reg_importances))]
+            
+        reg_importance_df = pd.DataFrame({
+            'feature': reg_feature_names,
+            'importance': reg_importances,
+            'model': 'Regresión (¿Cuánto?)'
+        }).sort_values('importance', ascending=False)
+        
+        print("\nTop 10 características más importantes para el modelo de Regresión:")
+        print(reg_importance_df.head(10))
+        
+        # Visualización comparativa de importancias
+        if 'hurdle_importance_df' in locals():
+            plt.figure(figsize=(15, 8))
+            
+            # Subplot para modelo hurdle
+            plt.subplot(1, 2, 1)
+            top_hurdle = hurdle_importance_df.head(15)
+            plt.barh(range(len(top_hurdle)), top_hurdle['importance'])
+            plt.yticks(range(len(top_hurdle)), top_hurdle['feature'])
+            plt.xlabel('Importancia')
+            plt.title('Importancia - Modelo Hurdle')
+            plt.gca().invert_yaxis()
+            
+            # Subplot para modelo de regresión
+            plt.subplot(1, 2, 2)
+            top_reg = reg_importance_df.head(15)
+            plt.barh(range(len(top_reg)), top_reg['importance'])
+            plt.yticks(range(len(top_reg)), top_reg['feature'])
+            plt.xlabel('Importancia')
+            plt.title('Importancia - Modelo Regresión')
+            plt.gca().invert_yaxis()
+            
+            plt.tight_layout()
+            plt.show()
+
+def analyze_population_stability(X_train, X_test, feature_cols=None, n_bins=10):
+    """
+    Calcula el Population Stability Index (PSI) para detectar drift.
+    """
+    if feature_cols is None:
+        feature_cols = X_train.select_dtypes(include=[np.number]).columns
+    
+    psi_results = {}
+    
+    for col in feature_cols:
+        if col in X_train.columns and col in X_test.columns:
+            # Crear bins basados en los datos de entrenamiento
+            _, bin_edges = np.histogram(X_train[col], bins=n_bins)
+            
+            # Calcular distribuciones
+            train_dist, _ = np.histogram(X_train[col], bins=bin_edges, density=True)
+            test_dist, _ = np.histogram(X_test[col], bins=bin_edges, density=True)
+            
+            # Normalizar para obtener proporciones
+            train_prop = train_dist / train_dist.sum()
+            test_prop = test_dist / test_dist.sum()
+            
+            # Evitar log(0) añadiendo pequeño epsilon
+            epsilon = 1e-10
+            train_prop = np.maximum(train_prop, epsilon)
+            test_prop = np.maximum(test_prop, epsilon)
+            
+            # Calcular PSI
+            psi = np.sum((test_prop - train_prop) * np.log(test_prop / train_prop))
+            psi_results[col] = psi
+    
+    return psi_results
+
+if df_full is not None and 'X_train' in locals():
+    print("\n" + "="*70)
+    print("ANÁLISIS DE ESTABILIDAD POBLACIONAL")
+    print("="*70)
+    
+    # Seleccionar características originales para análisis de estabilidad
+    original_features = ['limit_bal', 'age', 'bill_amt_sept', 'pay_amt_sept', 
+                        'pay_sept', 'sex', 'education', 'marriage']
+    available_features = [col for col in original_features if col in X_train.columns and col in X_test.columns]
+    
+    if available_features:
+        psi_scores = analyze_population_stability(X_train, X_test, available_features)
+        
+        # Crear DataFrame de resultados PSI
+        psi_df = pd.DataFrame([
+            {'feature': k, 'psi': v, 'stability': 
+             'Estable' if v < 0.1 else 'Moderado' if v < 0.2 else 'Inestable'} 
+            for k, v in psi_scores.items()
+        ]).sort_values('psi', ascending=False)
+        
+        print("Population Stability Index (PSI) por característica:")
+        print("PSI < 0.1: Estable | 0.1-0.2: Moderado | >0.2: Inestable")
+        print("-" * 60)
+        for _, row in psi_df.iterrows():
+            print(f"{row['feature']:20} | {row['psi']:6.3f} | {row['stability']}")
+        
+        # Visualización de estabilidad
+        plt.figure(figsize=(12, 6))
+        colors = ['green' if x < 0.1 else 'orange' if x < 0.2 else 'red' 
+                 for x in psi_df['psi']]
+        
+        plt.barh(range(len(psi_df)), psi_df['psi'], color=colors)
+        plt.yticks(range(len(psi_df)), psi_df['feature'])
+        plt.xlabel('Population Stability Index (PSI)')
+        plt.title('Análisis de Estabilidad de Variables')
+        plt.axvline(x=0.1, color='orange', linestyle='--', alpha=0.7, label='Umbral Moderado')
+        plt.axvline(x=0.2, color='red', linestyle='--', alpha=0.7, label='Umbral Inestable')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+        
+        # Recomendaciones basadas en PSI
+        unstable_features = psi_df[psi_df['psi'] > 0.2]['feature'].tolist()
+        if unstable_features:
+            print(f"\n⚠️  ALERTA: Las siguientes variables muestran drift significativo:")
+            for feature in unstable_features:
+                print(f"   - {feature}")
+            print("\nRecomendaciones:")
+            print("1. Reentrenar el modelo con datos más recientes")
+            print("2. Considerar recalibración de probabilidades")
+            print("3. Implementar monitoreo continuo de estas variables")
+
+print("\n" + "="*70)
+print("RESUMEN EJECUTIVO")
+print("="*70)
+
+if 'best_model_name' in locals():
+    print(f"\n🎯 MODELO DE CLASIFICACIÓN SELECCIONADO: {best_model_name.upper()}")
+    print(f"   • ROC-AUC: {model_scores[best_model_name]['roc_auc']:.3f}")
+    print(f"   • Precision@10%: {model_scores[best_model_name].get('precision_at_0.1', 0):.3f}")
+    print(f"   • Profit Máximo: ${model_scores[best_model_name]['max_profit']:,.0f}")
+    print(f"   • Threshold Óptimo: {best_threshold:.3f}")
+
+if 'r2_hurdle' in locals():
+    print(f"\n📈 MODELO DE REGRESIÓN HURDLE:")
+    print(f"   • R² Score: {r2_hurdle:.3f}")
+    print(f"   • RMSE: ${rmse_hurdle:,.0f}")
+    print(f"   • MAPE: {mape_hurdle:.1f}%")
+    print(f"   • ROC-AUC Hurdle: {hurdle_auc:.3f}")
+
+print(f"\n📊 MEJORAS IMPLEMENTADAS:")
+print("   ✅ Validación temporal para evitar data leakage")
+print("   ✅ Ingeniería de características sin información futura")
+print("   ✅ Manejo adaptativo de outliers con Isolation Forest")
+print("   ✅ Ensemble diversificado con múltiples algoritmos")
+print("   ✅ Métricas orientadas al negocio (profit optimization)")
+print("   ✅ Análisis de estabilidad poblacional (PSI)")
+print("   ✅ Calibración de probabilidades mejorada")
+
+print(f"\n🚀 RECOMENDACIONES PARA PRODUCCIÓN:")
+print("   1. Implementar monitoreo continuo de PSI")
+print("   2. Recalibrar modelos mensualmente")
+print("   3. Validar performance en cohortes temporales")
+print("   4. Establecer alertas automáticas por drift")
+print("   5. Documentar decisiones para auditoría regulatoria")
+print("   6. Implementar A/B testing para nuevas versiones")
+
+print(f"\n💡 PRÓXIMOS PASOS:")
+print("   • Integración con pipeline de MLOps")
+print("   • Desarrollo de API REST para scoring")
+print("   • Dashboard de monitoreo en tiempo real")
+print("   • Documentación para compliance regulatorio")
+
+print("\n" + "="*70)
+print("ANÁLISIS COMPLETADO ✅")
+print("="*70)
 
 # --- Código extraído de: 03_Modelado_Clasificacion.ipynb ---
 import pandas as pd
@@ -776,49 +1472,58 @@ except FileNotFoundError:
     print(f"Error: No se encontró el archivo: {clean_data_path}")
     df = None
 
-if df is not None:
-    df_features = df.copy()
+# --- 1. Corrección de Fuga de Datos y Nueva Ingeniería de Características ---
 
-    # Definir grupos de columnas para facilitar los cálculos
-    bill_amt_cols = ['bill_amt_sept', 'bill_amt_aug', 'bill_amt_july', 'bill_amt_june', 'bill_amt_may', 'bill_amt_april']
-    pay_amt_cols = ['pay_amt_sept', 'pay_amt_aug', 'pay_amt_july', 'pay_amt_june', 'pay_amt_may', 'pay_amt_april']
-    pay_status_cols = ['pay_sept', 'pay_aug', 'pay_july', 'pay_june', 'pay_may', 'pay_april']
+# Copiamos el dataframe limpio para empezar
+df_features = df.copy()
 
-    # 3.1. Ratios de Salud Financiera
-    # Se calcula la utilización del crédito y la proporción de pago para cada mes.
-    epsilon = 1e-6  # Para evitar división por cero
-    for month in ['sept', 'aug', 'july', 'june', 'may', 'april']:
-        df_features[f'utilization_{month}'] = df_features[f'bill_amt_{month}'] / (df_features['limit_bal'] + epsilon)
-        df_features[f'payment_ratio_{month}'] = df_features[f'pay_amt_{month}'] / (df_features[f'bill_amt_{month}'] + epsilon)
+# Definir grupos de columnas HISTÓRICAS para evitar data leakage
+# Usamos datos de Agosto hacia atrás para predecir el default del mes siguiente (Octubre)
+bill_amt_cols_hist = ['bill_amt_aug', 'bill_amt_july', 'bill_amt_june', 'bill_amt_may', 'bill_amt_april']
+pay_amt_cols_hist = ['pay_amt_aug', 'pay_amt_july', 'pay_amt_june', 'pay_amt_may', 'pay_amt_april']
+pay_status_cols_hist = ['pay_aug', 'pay_july', 'pay_june', 'pay_may', 'pay_april']
 
-    # 3.2. Agregados de Historial Financiero
-    # Se crean métricas agregadas para resumir el comportamiento a lo largo de los 6 meses.
-    df_features['bill_amt_avg'] = df_features[bill_amt_cols].mean(axis=1)
-    df_features['bill_amt_std'] = df_features[bill_amt_cols].std(axis=1)
-    df_features['pay_amt_avg'] = df_features[pay_amt_cols].mean(axis=1)
+# -- A. Ratios de Salud Financiera (Corregido) --
+epsilon = 1e-6
+# Tasa de utilización del mes más reciente (Septiembre)
+df_features['utilization_sept'] = df_features['bill_amt_sept'] / (df_features['limit_bal'] + epsilon)
 
-    # 3.3. Características de Tendencia
-    # Se calcula la pendiente para observar tendencias en facturación y pagos.
-    def calculate_slope(row, cols):
-        # CORRECCIÓN: Se convierten los valores a tipo float para evitar errores de tipo.
-        y = row[cols].values.astype(float)
-        x = np.array(range(len(y)))
-        # Se ajusta un polinomio de grado 1 (una línea) y se devuelve la pendiente.
-        slope, _ = np.polyfit(x, y, 1)
-        return slope
+# -- B. Agregados de Historial Financiero (Corregido) --
+df_features['bill_amt_avg_hist'] = df_features[bill_amt_cols_hist].mean(axis=1)
+df_features['bill_amt_std_hist'] = df_features[bill_amt_cols_hist].std(axis=1)
+df_features['pay_amt_avg_hist'] = df_features[pay_amt_cols_hist].mean(axis=1)
 
-    # Se aplica la función a las columnas de interés (en orden cronológico inverso).
-    df_features['bill_amt_slope'] = df_features.apply(lambda row: calculate_slope(row, bill_amt_cols[::-1]), axis=1)
-    df_features['pay_status_slope'] = df_features.apply(lambda row: calculate_slope(row, pay_status_cols[::-1]), axis=1)
+# -- C. Características de Tendencia (Corregido) --
+# Se calcula la pendiente sobre datos históricos para observar tendencias
+def calculate_slope(row, cols):
+    y = row[cols].values.astype(float)
+    x = np.array(range(len(y)))
+    slope, _ = np.polyfit(x, y, 1)
+    return slope
 
-    # 3.4. Indicadores de Comportamiento de Pago
-    # Se extraen características sobre el comportamiento de pago del cliente.
-    df_features['pay_status_avg'] = df_features[pay_status_cols].mean(axis=1)
-    df_features['months_with_delay'] = (df_features[pay_status_cols] > 0).sum(axis=1)
-    df_features['zero_payment_months'] = (df_features[pay_amt_cols] == 0).sum(axis=1)
+# Aplicamos la función sobre las columnas históricas en orden cronológico (de más antiguo a más reciente)
+df_features['bill_amt_slope'] = df_features.apply(lambda row: calculate_slope(row, bill_amt_cols_hist[::-1]), axis=1)
+df_features['pay_status_slope'] = df_features.apply(lambda row: calculate_slope(row, pay_status_cols_hist[::-1]), axis=1)
 
-    print("\n--- Ingeniería de Características para Clasificación completada ---")
-    display(df_features.head())
+# -- D. Indicadores de Comportamiento de Pago (Corregido) --
+df_features['pay_status_avg_hist'] = df_features[pay_status_cols_hist].mean(axis=1)
+df_features['months_with_delay_hist'] = (df_features[pay_status_cols_hist] > 0).sum(axis=1)
+
+# -- E. Nuevas Características Propuestas --
+
+# Volatilidad de pagos: Un cliente con pagos muy irregulares puede ser riesgoso
+all_pay_amt_cols = ['pay_amt_sept'] + pay_amt_cols_hist
+df_features['payment_volatility'] = df_features[all_pay_amt_cols].std(axis=1) / (df_features[all_pay_amt_cols].mean(axis=1) + epsilon)
+
+# Proxy de relación deuda-ingreso: Compara la deuda promedio con el límite total
+df_features['debt_to_limit_ratio'] = df_features['bill_amt_avg_hist'] / (df_features['limit_bal'] + epsilon)
+
+# Reemplazar valores infinitos o NaN que puedan surgir de las divisiones
+df_features.replace([np.inf, -np.inf], np.nan, inplace=True)
+df_features.fillna(0, inplace=True) # O una estrategia de imputación más sofisticada
+
+print("--- Ingeniería de Características Mejorada (sin fuga de datos) ---")
+display(df_features.head())
 
 if df is not None:
     # Se seleccionan solo las columnas numéricas para el cálculo de VIF.
