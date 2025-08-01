@@ -5,3 +5,5 @@ data/processed/*
 !data/processed/.gitkeep
 
 .DS_Store
+
+notebooks/catboost_info/
