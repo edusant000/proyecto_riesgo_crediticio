@@ -1,0 +1,888 @@
+# --- Código extraído de: 05_Modelo_Avanzado.ipynb ---
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+
+# Preprocesamiento y Pipelines
+from sklearn.model_selection import (train_test_split, StratifiedKFold, 
+                                     TimeSeriesSplit, RandomizedSearchCV, 
+                                     cross_val_score)
+from sklearn.preprocessing import StandardScaler, PowerTransformer
+from sklearn.pipeline import Pipeline
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.combine import SMOTEENN
+from scipy.stats.mstats import winsorize
+from sklearn.calibration import CalibratedClassifierCV
+
+# Modelos
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingRegressor
+from xgboost import XGBClassifier, XGBRegressor
+from sklearn.linear_model import TweedieRegressor
+
+# Métricas y Interpretabilidad
+from sklearn.metrics import (classification_report, roc_auc_score, f1_score, 
+                             precision_recall_curve, auc, r2_score, 
+                             mean_squared_error)
+import shap
+
+warnings.filterwarnings('ignore', category=FutureWarning)
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 7)
+RANDOM_STATE = 42
+
+try:
+    project_root = Path.cwd().parent
+    processed_path = project_root / "data" / "processed"
+    
+    df_full = pd.read_csv(processed_path / "features_clasificacion.csv")
+    df_reg = pd.read_csv(processed_path / "features_regresion.csv")
+    
+    print("Datasets cargados exitosamente.")
+    print(f"Forma del dataset de clasificación: {df_full.shape}")
+    print(f"Forma del dataset de regresión: {df_reg.shape}")
+
+except FileNotFoundError as e:
+    print(f"Error: No se encontró el archivo. Verifica la ruta: {e}")
+    df_full = None
+    df_reg = None
+
+if df_full is not None:
+    print("\n--- Iniciando Modelado de Clasificación Avanzado ---")
+    
+    # --- 3.1. Preparación de Datos ---
+    X = df_full.select_dtypes(include=np.number).drop(columns=['default_payment_next_month', 'ID'])
+    y = df_full['default_payment_next_month']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+
+    # --- 3.2. Búsqueda de Hiperparámetros con Pipeline y Validación Cruzada Estratificada ---
+    print("\n--- Buscando mejores hiperparámetros para Random Forest ---")
+    
+    # Pipeline con muestreo avanzado, escalado y clasificador
+    pipeline_rf = ImbPipeline([
+        ('sampler', SMOTEENN(random_state=RANDOM_STATE)),
+        ('scaler', StandardScaler()),
+        ('classifier', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1))
+    ])
+    
+    # Parrilla de parámetros para RandomizedSearchCV
+    param_dist_rf = {
+        'classifier__n_estimators': [100, 200, 300],
+        'classifier__max_depth': [10, 20, 30, None],
+        'classifier__min_samples_split': [2, 5, 10],
+        'classifier__min_samples_leaf': [1, 2, 4],
+        'classifier__class_weight': ['balanced', 'balanced_subsample', None]
+    }
+    
+    # Validación cruzada estratificada
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE) # 3 splits para agilizar
+    
+    random_search_rf = RandomizedSearchCV(
+        estimator=pipeline_rf,
+        param_distributions=param_dist_rf,
+        n_iter=10, # 10 iteraciones para una búsqueda rápida
+        cv=skf,
+        scoring='f1_macro',
+        verbose=1,
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+    
+    random_search_rf.fit(X_train, y_train)
+    best_clf = random_search_rf.best_estimator_
+    print(f"\nMejores parámetros encontrados para Random Forest: {random_search_rf.best_params_}")
+
+    # --- 3.3. Calibración de Probabilidades ---
+    print("\n--- Calibrando probabilidades del mejor modelo ---")
+    calibrated_clf = CalibratedClassifierCV(best_clf, method='isotonic', cv=skf)
+    calibrated_clf.fit(X_train, y_train)
+    y_pred_proba_calibrated = calibrated_clf.predict_proba(X_test)[:, 1]
+
+    # --- 3.4. Optimización de Umbral y Visualización de Curva PR ---
+    print("\n--- Optimizando umbral de decisión ---")
+    precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba_calibrated)
+    f1_scores = (2 * recall * precision) / (recall + precision + 1e-9)
+    optimal_idx = np.argmax(f1_scores)
+    optimal_threshold = thresholds[optimal_idx]
+    
+    plt.figure()
+    plt.plot(recall, precision, label='Curva Precision-Recall')
+    plt.scatter(recall[optimal_idx], precision[optimal_idx], marker='o', color='red', label=f'Mejor Umbral ({optimal_threshold:.2f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precisión')
+    plt.title('Curva Precision-Recall para el Modelo Optimizado')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    print(f"Umbral óptimo que maximiza F1-Score: {optimal_threshold:.4f}")
+    
+    # --- 3.5. Evaluación Final del Modelo de Clasificación ---
+    y_pred_optimal = (y_pred_proba_calibrated >= optimal_threshold).astype(int)
+    print("\n--- Reporte de Clasificación Final (con umbral optimizado) ---")
+    print(classification_report(y_test, y_pred_optimal, target_names=['No Incumplimiento', 'Incumplimiento']))
+
+    # --- 3.6. Interpretabilidad con SHAP ---
+    print("\n--- Análisis de Interpretabilidad con SHAP ---")
+    # SHAP requiere un modelo base, extraemos el clasificador del pipeline
+    # y lo re-entrenamos en los datos transformados para la explicación.
+    sampler = best_clf.named_steps['sampler']
+    scaler = best_clf.named_steps['scaler']
+    model = best_clf.named_steps['classifier']
+    
+    X_train_res, y_train_res = sampler.fit_resample(X_train, y_train)
+    X_train_scaled = scaler.fit_transform(X_train_res)
+    model.fit(X_train_scaled, y_train_res) # Re-entrenamiento para SHAP
+    
+    X_test_scaled = scaler.transform(X_test)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test_scaled)
+    shap_vals_class1 = shap_values[1][:, :X_test_scaled.shape[1]]
+    shap.summary_plot(
+        shap_vals_class1,
+        features=X_test_scaled,
+        feature_names=X_test.columns,
+        plot_type="bar",
+        max_display=15
+    )
+    
+    print("Generando gráfico de resumen de SHAP (Clase 1: Incumplimiento)...")
+    # CORRECCIÓN: Se pasa el array escalado (X_test_scaled) y los nombres de las columnas
+    # por separado para evitar el error de aserción de forma.
+    shap.summary_plot(shap_values[1], features=X_test_scaled, feature_names=X_test.columns, plot_type="bar", max_display=15)
+
+if df_reg is not None:
+    print("\n--- Iniciando Modelado de Regresión Avanzado (Hurdle Model) ---")
+    
+    # --- 4.1. Preparación de Datos ---
+    X_reg = df_reg.select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
+    y_reg = df_reg['pay_amt_june']
+    
+    y_hurdle_class = (y_reg > 0).astype(int)
+    df_reg_pos = df_reg[df_reg['pay_amt_june'] > 0]
+    X_reg_pos = df_reg_pos.select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'])
+    y_reg_pos = df_reg_pos['pay_amt_june']
+    
+    X_train_reg, X_test_reg, y_train_hurdle_class, y_test_hurdle_class, y_train_reg_orig, y_test_reg_orig = train_test_split(
+        X_reg, y_hurdle_class, y_reg, test_size=0.2, random_state=RANDOM_STATE, stratify=y_hurdle_class
+    )
+    X_train_reg_pos, X_test_reg_pos, y_train_reg_pos, y_test_reg_pos = train_test_split(
+        X_reg_pos, y_reg_pos, test_size=0.2, random_state=RANDOM_STATE
+    )
+
+    # --- 4.2. Etapa 1: Entrenamiento del Clasificador del Obstáculo ---
+    print("\n--- Entrenando Etapa 1: Clasificador del Obstáculo ---")
+    scale_pos_weight_hurdle = y_train_hurdle_class.value_counts()[0] / y_train_hurdle_class.value_counts()[1]
+    pipeline_hurdle_class = ImbPipeline([
+        ('sampler', SMOTEENN(random_state=RANDOM_STATE)),
+        ('scaler', StandardScaler()),
+        ('classifier', XGBClassifier(random_state=RANDOM_STATE, use_label_encoder=False, eval_metric='logloss', scale_pos_weight=scale_pos_weight_hurdle))
+    ])
+    pipeline_hurdle_class.fit(X_train_reg, y_train_hurdle_class)
+    
+    # --- 4.3. Etapa 2: Entrenamiento del Regresor de Monto con Validación Temporal ---
+    print("\n--- Entrenando Etapa 2: Regresor de Monto ---")
+    
+    # Aplicar winsorización para tratar outliers
+    y_train_reg_pos_win = winsorize(y_train_reg_pos, limits=[0.01, 0.01])
+    
+    # Pipeline para el regresor
+    pipeline_reg = Pipeline([
+        ('scaler', StandardScaler()),
+        ('transformer', PowerTransformer(method='yeo-johnson')), # Transformación flexible
+        ('regressor', HistGradientBoostingRegressor(random_state=RANDOM_STATE)) # Modelo robusto a outliers
+    ])
+    
+    # Validación cruzada temporal
+    tscv = TimeSeriesSplit(n_splits=5)
+    rmse_scores = cross_val_score(pipeline_reg, X_train_reg_pos, y_train_reg_pos_win, cv=tscv, scoring='neg_root_mean_squared_error', n_jobs=-1)
+    print(f"RMSE Promedio en Validación Cruzada Temporal: {-np.mean(rmse_scores):.2f}")
+    
+    # Entrenamiento final del regresor
+    pipeline_reg.fit(X_train_reg_pos, y_train_reg_pos_win)
+
+    # --- 4.4. Combinación y Evaluación Final del Modelo ---
+    print("\n--- Evaluación Final del Modelo de Obstáculo Combinado ---")
+    pred_paga_o_no = pipeline_hurdle_class.predict(X_test_reg)
+    pred_monto_si_paga = pipeline_reg.predict(X_test_reg)
+    final_predictions = pred_monto_si_paga * pred_paga_o_no
+    
+    r2_hurdle = r2_score(y_test_reg_orig, final_predictions)
+    rmse_hurdle = np.sqrt(mean_squared_error(y_test_reg_orig, final_predictions))
+    
+    print(f"R² Score Final: {r2_hurdle:.4f}")
+    print(f"RMSE Final: {rmse_hurdle:.4f}")
+
+# --- Código extraído de: 03_Modelado_Clasificacion.ipynb ---
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, f1_score, precision_recall_curve, auc
+
+try:
+    project_root = Path.cwd().parent
+    processed_path = project_root / "data" / "processed"
+    
+    df_full = pd.read_csv(processed_path / "features_clasificacion.csv")
+    df_reduced = pd.read_csv(processed_path / "features_reducido_clasificacion.csv")
+    
+    print("Datasets cargados exitosamente.")
+    print(f"Forma del dataset completo: {df_full.shape}")
+    print(f"Forma del dataset reducido: {df_reduced.shape}")
+
+except FileNotFoundError as e:
+    print(f"Error: No se encontró el archivo. Verifica la ruta: {e}")
+    df_full = None
+    df_reduced = None
+
+def train_and_evaluate_model(X, y, model, model_name, dataset_name):
+    """
+    Entrena y evalúa un modelo de clasificación, manejando el desbalance de clases.
+    
+    Args:
+        X (pd.DataFrame): Características.
+        y (pd.Series): Variable objetivo.
+        model: Instancia del modelo de scikit-learn.
+        model_name (str): Nombre del modelo para reportes.
+        dataset_name (str): Nombre del dataset para reportes.
+        
+    Returns:
+        dict: Un diccionario con las métricas de evaluación.
+    """
+    # 3.1. División de datos (estratificada para mantener la proporción de clases)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    # 3.2. Balanceo de Clases (SMOTE) - Solo en el conjunto de entrenamiento
+    smote = SMOTE(random_state=42)
+    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    
+    # 3.3. Escalado de Características
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_res)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 3.4. Entrenamiento del Modelo
+    model.fit(X_train_scaled, y_train_res)
+    
+    # 3.5. Predicción y Evaluación
+    y_pred = model.predict(X_test_scaled)
+    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+    
+    # 3.6. Recopilación de Métricas
+    metrics = {
+        'Model': model_name,
+        'Dataset': dataset_name,
+        'Accuracy': accuracy_score(y_test, y_pred),
+        'ROC-AUC': roc_auc_score(y_test, y_pred_proba),
+        'F1-Score (Default)': f1_score(y_test, y_pred, pos_label=1)
+    }
+    
+    print(f"\n--- Resultados para {model_name} en {dataset_name} ---")
+    print(classification_report(y_test, y_pred, target_names=['No Incumplimiento', 'Incumplimiento']))
+    
+    return metrics
+
+if df_full is not None and df_reduced is not None:
+    # CORRECCIÓN: Asegurarse de que solo se usan columnas numéricas para el modelado.
+    # Se seleccionan solo los dtypes numéricos y se eliminan las columnas que no son características.
+    X_full = df_full.select_dtypes(include=np.number).drop(columns=['default_payment_next_month', 'ID'], errors='ignore')
+    y_full = df_full['default_payment_next_month']
+    
+    X_reduced = df_reduced.select_dtypes(include=np.number).drop(columns=['default_payment_next_month'], errors='ignore')
+    y_reduced = df_reduced['default_payment_next_month']
+
+    datasets = {
+        "Completo": (X_full, y_full),
+        "Reducido": (X_reduced, y_reduced)
+    }
+    
+    # Definir los modelos a probar
+    models = {
+        "Regresión Logística": LogisticRegression(random_state=42, max_iter=1000),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    }
+    
+    results = []
+    
+    # Iterar sobre cada dataset y cada modelo
+    for d_name, (X_data, y_data) in datasets.items():
+        for m_name, model_instance in models.items():
+            metrics = train_and_evaluate_model(X_data, y_data, model_instance, m_name, d_name)
+            results.append(metrics)
+            
+    # 4.1. Tabla Comparativa de Resultados
+    results_df = pd.DataFrame(results).sort_values(by='F1-Score (Default)', ascending=False)
+    
+    print("\n--- Tabla Comparativa de Rendimiento de Modelos ---")
+    display(results_df)
+
+if 'results_df' in locals():
+    best_model_name = results_df.iloc[0]['Model']
+    best_dataset_name = results_df.iloc[0]['Dataset']
+    
+    print(f"\n--- Análisis Profundo del Mejor Modelo: {best_model_name} en Dataset {best_dataset_name} ---")
+    
+    # Re-entrenar el mejor modelo para obtener los artefactos (importancia, curvas)
+    X_best, y_best = datasets[best_dataset_name]
+    model_best = models[best_model_name]
+    
+    # Repetir el preprocesamiento
+    X_train, X_test, y_train, y_test = train_test_split(X_best, y_best, test_size=0.2, random_state=42, stratify=y_best)
+    smote = SMOTE(random_state=42)
+    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_res)
+    X_test_scaled = scaler.transform(X_test)
+    
+    model_best.fit(X_train_scaled, y_train_res)
+    y_pred_proba_best = model_best.predict_proba(X_test_scaled)[:, 1]
+    
+    # 5.1. Importancia de Características
+    if hasattr(model_best, 'feature_importances_'):
+        importances = model_best.feature_importances_
+        feature_names = X_best.columns
+        
+        feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+        feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+        
+        plt.figure(figsize=(10, 12))
+        sns.barplot(x='importance', y='feature', data=feature_importance_df.head(20), palette='mako')
+        plt.title('Top 20 Características más Importantes')
+        plt.xlabel('Importancia')
+        plt.ylabel('Característica')
+        plt.tight_layout()
+        plt.show()
+        
+    # 5.2. Curva de Precisión-Recall
+    precision, recall, _ = precision_recall_curve(y_test, y_pred_proba_best)
+    pr_auc = auc(recall, precision)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision, color='darkorange', lw=2, label=f'Curva PR (área = {pr_auc:.2f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precisión')
+    plt.title('Curva de Precisión-Recall del Mejor Modelo')
+    plt.legend(loc="lower left")
+    plt.grid(True)
+    plt.show()
+
+if 'X_train_scaled' in locals():
+    print("\n--- Iniciando Optimización de Hiperparámetros para Random Forest ---")
+    
+    # 6.1. Definir la parrilla de parámetros para la búsqueda aleatoria
+    param_distributions = {
+        'n_estimators': [100, 200, 300, 400],
+        'max_depth': [10, 20, 30, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 'log2']
+    }
+    
+    # 6.2. Configurar la Búsqueda Aleatoria
+    rf_clf = RandomForestClassifier(random_state=42, n_jobs=-1)
+    
+    random_search = RandomizedSearchCV(
+        estimator=rf_clf,
+        param_distributions=param_distributions,
+        n_iter=50,  # Número de combinaciones a probar
+        cv=3,       # Número de validaciones cruzadas
+        scoring='f1', # Métrica a optimizar (F1 para la clase positiva por defecto)
+        verbose=2,
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    # 6.3. Ejecutar la búsqueda en los datos de entrenamiento
+    random_search.fit(X_train_scaled, y_train_res)
+    
+    # 6.4. Mostrar los mejores parámetros
+    print("\n--- Mejores Hiperparámetros Encontrados ---")
+    print(random_search.best_params_)
+    
+    # 6.5. Evaluar el modelo optimizado
+    best_rf_clf = random_search.best_estimator_
+    y_pred_best_rf = best_rf_clf.predict(X_test_scaled)
+    y_pred_proba_best_rf = best_rf_clf.predict_proba(X_test_scaled)[:, 1]
+    
+    print("\n--- Métricas de Evaluación del Modelo Random Forest OPTIMIZADO ---")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred_best_rf):.4f}")
+    print(f"ROC-AUC Score: {roc_auc_score(y_test, y_pred_proba_best_rf):.4f}")
+    print("\nReporte de Clasificación (Optimizado):")
+    print(classification_report(y_test, y_pred_best_rf, target_names=['No Incumplimiento', 'Incumplimiento']))
+
+# --- Código extraído de: 01_Analisis_Exploratorio.ipynb ---
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (10, 6)
+
+try:
+    project_root = Path.cwd().parent
+    data_file_path = project_root / "data" / "raw" / "default_of_credit_card_clients.xls"
+    
+    if data_file_path.exists():
+        print(f"Archivo encontrado en: {data_file_path}")
+        # Se lee el archivo Excel, omitiendo la primera fila que no contiene datos.
+        df_original = pd.read_excel(data_file_path, skiprows=1)
+    else:
+        print(f"Error: No se encontró el archivo en la ruta esperada: {data_file_path}")
+        df_original = None
+
+except Exception as e:
+    print(f"Ocurrió un error al cargar el archivo: {e}")
+    df_original = None
+
+if df_original is not None:
+    print("\n--- Vista Previa de los Datos Originales ---")
+    display(df_original.head())
+    
+    print("\n--- Información General del DataFrame ---")
+    df_original.info()
+else:
+    print("\nNo se pudo cargar el DataFrame. El análisis no puede continuar.")
+
+df = df_original.copy()
+
+df.rename(columns={
+    'LIMIT_BAL': 'limit_bal', 'SEX': 'sex', 'EDUCATION': 'education', 'MARRIAGE': 'marriage', 'AGE': 'age',
+    'PAY_0': 'pay_sept', 'PAY_2': 'pay_aug', 'PAY_3': 'pay_july', 'PAY_4': 'pay_june', 'PAY_5': 'pay_may', 'PAY_6': 'pay_april',
+    'BILL_AMT1': 'bill_amt_sept', 'BILL_AMT2': 'bill_amt_aug', 'BILL_AMT3': 'bill_amt_july', 'BILL_AMT4': 'bill_amt_june', 'BILL_AMT5': 'bill_amt_may', 'BILL_AMT6': 'bill_amt_april',
+    'PAY_AMT1': 'pay_amt_sept', 'PAY_AMT2': 'pay_amt_aug', 'PAY_AMT3': 'pay_amt_july', 'PAY_AMT4': 'pay_amt_june', 'PAY_AMT5': 'pay_amt_may', 'PAY_AMT6': 'pay_amt_april',
+    'default payment next month': 'default_payment_next_month'
+}, inplace=True)
+
+# 'education': Se agrupan valores no documentados (0, 5, 6) en la categoría 'Otros' (4).
+df['education'] = df['education'].replace([0, 5, 6], 4)
+# 'marriage': Se agrupa el valor no documentado (0) en 'Otros' (3).
+df['marriage'] = df['marriage'].replace(0, 3)
+
+print("Education:", sorted(df['education'].unique()))
+print("Marriage:", sorted(df['marriage'].unique()))
+
+display(df.describe())
+
+default_counts = df['default_payment_next_month'].value_counts()
+print(default_counts)
+
+plt.figure(figsize=(6, 4))
+sns.countplot(x='default_payment_next_month', data=df, palette='viridis')
+plt.title('Distribución de Clientes por Incumplimiento de Pago')
+plt.xlabel('Incumplimiento (0 = No, 1 = Sí)')
+plt.ylabel('Cantidad de Clientes')
+plt.xticks([0, 1], ['No Incumplimiento (78%)', 'Incumplimiento (22%)'])
+plt.show()
+
+df['sex_label'] = df['sex'].map({1: 'Hombre', 2: 'Mujer'})
+df['education_label'] = df['education'].map({1: 'Posgrado', 2: 'Universidad', 3: 'Secundaria', 4: 'Otros'})
+df['marriage_label'] = df['marriage'].map({1: 'Casado/a', 2: 'Soltero/a', 3: 'Otros'})
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+sns.countplot(x='sex_label', data=df, ax=axes[0], palette='pastel')
+axes[0].set_title('Distribución por Género')
+sns.countplot(x='education_label', data=df, ax=axes[1], palette='pastel', order=df['education_label'].value_counts().index)
+axes[1].set_title('Distribución por Nivel Educativo')
+axes[1].tick_params(axis='x', rotation=45)
+sns.countplot(x='marriage_label', data=df, ax=axes[2], palette='pastel')
+axes[2].set_title('Distribución por Estado Civil')
+plt.suptitle('Análisis de Variables Demográficas', fontsize=16)
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+sns.histplot(df['limit_bal'], kde=True, ax=axes[0], bins=30, color='skyblue')
+axes[0].set_title('Distribución del Límite de Crédito')
+axes[0].set_xlabel('Límite de Crédito (NT$)')
+sns.histplot(df['age'], kde=True, ax=axes[1], bins=30, color='salmon')
+axes[1].set_title('Distribución de la Edad')
+axes[1].set_xlabel('Edad')
+plt.suptitle('Análisis de Variables Numéricas', fontsize=16)
+plt.show()
+
+df['pay_sept_label'] = df['pay_sept'].map({
+    -1: 'Pago puntual', 0: 'Pago mínimo', 1: 'Retraso 1 mes',
+    2: 'Retraso 2 meses', 3: 'Retraso 3 meses', 4: 'Retraso 4 meses',
+    5: 'Retraso 5 meses', 6: 'Retraso 6 meses', 7: 'Retraso 7 meses',
+    8: 'Retraso >8 meses'
+}).fillna('Otro')
+
+plt.figure(figsize=(12, 7))
+sns.countplot(y='pay_sept_label', data=df, order=df['pay_sept_label'].value_counts().index, palette='plasma')
+plt.title('Estado de Pago en Septiembre de 2005')
+plt.xlabel('Cantidad de Clientes')
+plt.ylabel('Estado del Pago')
+plt.show()
+
+corr_cols = ['limit_bal', 'age'] + [c for c in df.columns if 'bill_amt' in c] + [c for c in df.columns if 'pay_amt' in c] + ['default_payment_next_month']
+correlation_matrix = df[corr_cols].corr()
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(correlation_matrix, cmap='viridis', annot=False)
+plt.title('Matriz de Correlación', fontsize=16)
+plt.show()
+
+num_cols = ['limit_bal'] + [c for c in df.columns if c.startswith('bill_amt_')] + [c for c in df.columns if c.startswith('pay_amt_')]
+
+print("\n--- Cuantiles Extremos de Variables Financieras ---")
+v_q = df[num_cols].quantile([0, 0.01, 0.25, 0.5, 0.75, 0.99, 1]).T
+display(v_q)
+
+# Boxplots agrupados para una visualización compacta.
+fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+axes = axes.flatten()
+
+for i, col in enumerate(num_cols):
+    sns.boxplot(x=df[col], ax=axes[i], color='lightblue')
+    axes[i].set_title(col, fontsize=10)
+    axes[i].set_xlabel('')
+
+# Ocultar ejes sobrantes si el número de columnas no es múltiplo de 5.
+for j in range(i + 1, len(axes)):
+    axes[j].axis('off')
+
+plt.suptitle('Detección de Valores Atípicos en Variables Financieras', fontsize=18)
+plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+plt.show()
+
+# Análisis temporal agregado por mes.
+bill_cols = [c for c in df.columns if c.startswith('bill_amt_')]
+pay_cols  = [c for c in df.columns if c.startswith('pay_amt_')]
+month_names = ['Sept', 'Aug', 'July', 'June', 'May', 'April']
+
+df_ts = pd.DataFrame({
+    'facturacion': df[bill_cols].sum().values,
+    'pagos'      : df[pay_cols].sum().values
+}, index=month_names)
+
+df_ts.plot(marker='o', figsize=(10, 5))
+plt.title('Facturación Total vs. Pagos Totales por Mes')
+plt.xlabel('Mes (2005)')
+plt.ylabel('Monto Total (NT$)')
+plt.grid(True, which='both', linestyle='--')
+plt.show()
+
+try:
+    processed_data_path = project_root / "data" / "processed"
+    processed_data_path.mkdir(parents=True, exist_ok=True)
+    
+    # Se eliminan las columnas de etiquetas antes de guardar.
+    df_to_save = df.drop(columns=['sex_label', 'education_label', 'marriage_label'])
+    
+    file_path = processed_data_path / "credit_card_clients_clean.csv"
+    df_to_save.to_csv(file_path, index=False)
+    
+    print(f"\nDataFrame limpio guardado exitosamente en: {file_path}")
+
+except Exception as e:
+    print(f"\nOcurrió un error al guardar el archivo: {e}")
+
+try:
+    project_root = Path.cwd().parent
+    processed_data_path = project_root / "data" / "processed"
+    
+    processed_data_path.mkdir(parents=True, exist_ok=True)
+    
+    file_path = processed_data_path / "credit_card_clients_clean.csv"
+    df_clean.to_csv(file_path, index=False)
+    
+    print(f"\ DataFrame limpio guardado exitosamente en: {file_path}")
+
+except Exception as e:
+    print(f"\ Ocurrió un error al guardar el archivo: {e}")
+
+# --- Código extraído de: 04_Modelado_Regresion.ipynb ---
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression, HuberRegressor
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (10, 6)
+
+try:
+    project_root = Path.cwd().parent
+    features_path = project_root / "data" / "processed" / "features_regresion.csv"
+    df_reg = pd.read_csv(features_path)
+    print(f"DataFrame para regresión cargado desde: {features_path}")
+except FileNotFoundError:
+    print(f"Error: No se encontró el archivo en: {features_path}")
+    df_reg = None
+
+if df_reg is not None:
+    # Seleccionar solo columnas numéricas y definir X e y.
+    X = df_reg.select_dtypes(include=np.number).drop(columns=['pay_amt_june', 'ID'], errors='ignore')
+    y = df_reg['pay_amt_june']
+
+    # División de datos.
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Escalado de características.
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    print("\n--- Preparación de datos completada ---")
+    print(f"Forma de X_train: {X_train_scaled.shape}")
+    print(f"Forma de X_test: {X_test_scaled.shape}")
+
+def train_and_evaluate_regressor(X_train, y_train, X_test, y_test, model, model_name, use_log_transform=False):
+    """
+    Entrena un modelo de regresión, realiza predicciones y devuelve las métricas.
+    Permite elegir si se usa o no la transformación logarítmica en la variable objetivo.
+    """
+    y_train_target = y_train
+    if use_log_transform:
+        y_train_target = np.log1p(y_train)
+
+    # Entrenamiento
+    model.fit(X_train, y_train_target)
+    
+    # Predicción
+    y_pred = model.predict(X_test)
+    
+    # Transformación inversa si es necesario
+    if use_log_transform:
+        y_pred = np.expm1(y_pred)
+    
+    # Cálculo de métricas en la escala original
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = mean_absolute_error(y_test, y_pred)
+    
+    transform_label = "Con Log" if use_log_transform else "Sin Log"
+    print(f"\n--- Resultados para {model_name} ({transform_label}) ---")
+    print(f"R² Score: {r2:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"MAE: {mae:.4f}")
+    
+    metrics = {
+        'Model': model_name,
+        'Transformation': transform_label,
+        'R2 Score': r2,
+        'RMSE': rmse,
+        'MAE': mae
+    }
+    
+    return metrics, y_pred
+
+if 'X_train_scaled' in locals():
+    # Definir los modelos a probar
+    models = {
+        "Regresión Lineal": LinearRegression(),
+        "Regresión de Huber": HuberRegressor(max_iter=1000),
+        "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        "XGBoost": XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1)
+    }
+    
+    results = []
+    predictions = {}
+
+    # Iterar sobre cada modelo y cada tipo de transformación
+    for name, model in models.items():
+        # Experimento SIN transformación logarítmica
+        metrics_no_log, y_pred_no_log = train_and_evaluate_regressor(X_train_scaled, y_train, X_test_scaled, y_test, model, name, use_log_transform=False)
+        results.append(metrics_no_log)
+        predictions[f"{name} (Sin Log)"] = y_pred_no_log
+        
+        # Experimento CON transformación logarítmica
+        metrics_log, y_pred_log = train_and_evaluate_regressor(X_train_scaled, y_train, X_test_scaled, y_test, model, name, use_log_transform=True)
+        results.append(metrics_log)
+        predictions[f"{name} (Con Log)"] = y_pred_log
+
+    # 5.1. Tabla Comparativa de Resultados
+    results_df = pd.DataFrame(results).sort_values(by='R2 Score', ascending=False)
+    
+    print("\n--- Tabla Comparativa de Rendimiento de Modelos de Regresión ---")
+    display(results_df)
+
+if 'results_df' in locals() and not results_df.empty:
+    best_row = results_df.iloc[0]
+    best_model_name = best_row['Model']
+    best_transform_label = best_row['Transformation']
+    best_prediction_key = f"{best_model_name} ({best_transform_label})"
+    
+    print(f"\n--- Análisis Profundo del Mejor Modelo: {best_model_name} ({best_transform_label}) ---")
+    
+    # 6.1. Gráfico de Predicciones vs. Valores Reales
+    plt.figure(figsize=(8, 8))
+    sns.scatterplot(x=y_test, y=predictions[best_prediction_key], alpha=0.5)
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], '--r', linewidth=2)
+    plt.title(f'Valores Reales vs. Predicciones ({best_model_name} - {best_transform_label})')
+    plt.xlabel('Valores Reales (pay_amt_june)')
+    plt.ylabel('Predicciones')
+    plt.show()
+    
+    # 6.2. Importancia de Características (si el modelo lo permite)
+    best_model_instance = models[best_model_name]
+    # Re-entrenar en los datos correctos (log o no) para obtener las importancias
+    y_train_for_importance = np.log1p(y_train) if best_transform_label == "Con Log" else y_train
+    best_model_instance.fit(X_train_scaled, y_train_for_importance)
+
+    if hasattr(best_model_instance, 'feature_importances_'):
+        importances = best_model_instance.feature_importances_
+        feature_names = X.columns
+        
+        feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+        feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+        
+        plt.figure(figsize=(10, 10))
+        sns.barplot(x='importance', y='feature', data=feature_importance_df.head(20), palette='viridis')
+        plt.title(f'Top 20 Características más Importantes ({best_model_name})')
+        plt.xlabel('Importancia')
+        plt.ylabel('Característica')
+        plt.tight_layout()
+        plt.show()
+
+# --- Código extraído de: 02_Ingenieria_de_Caracteristicas.ipynb ---
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
+
+try:
+    project_root = Path.cwd().parent
+    clean_data_path = project_root / "data" / "processed" / "credit_card_clients_clean.csv"
+    df = pd.read_csv(clean_data_path)
+    print(f"DataFrame limpio cargado desde: {clean_data_path}")
+except FileNotFoundError:
+    print(f"Error: No se encontró el archivo: {clean_data_path}")
+    df = None
+
+if df is not None:
+    df_features = df.copy()
+
+    # Definir grupos de columnas para facilitar los cálculos
+    bill_amt_cols = ['bill_amt_sept', 'bill_amt_aug', 'bill_amt_july', 'bill_amt_june', 'bill_amt_may', 'bill_amt_april']
+    pay_amt_cols = ['pay_amt_sept', 'pay_amt_aug', 'pay_amt_july', 'pay_amt_june', 'pay_amt_may', 'pay_amt_april']
+    pay_status_cols = ['pay_sept', 'pay_aug', 'pay_july', 'pay_june', 'pay_may', 'pay_april']
+
+    # 3.1. Ratios de Salud Financiera
+    # Se calcula la utilización del crédito y la proporción de pago para cada mes.
+    epsilon = 1e-6  # Para evitar división por cero
+    for month in ['sept', 'aug', 'july', 'june', 'may', 'april']:
+        df_features[f'utilization_{month}'] = df_features[f'bill_amt_{month}'] / (df_features['limit_bal'] + epsilon)
+        df_features[f'payment_ratio_{month}'] = df_features[f'pay_amt_{month}'] / (df_features[f'bill_amt_{month}'] + epsilon)
+
+    # 3.2. Agregados de Historial Financiero
+    # Se crean métricas agregadas para resumir el comportamiento a lo largo de los 6 meses.
+    df_features['bill_amt_avg'] = df_features[bill_amt_cols].mean(axis=1)
+    df_features['bill_amt_std'] = df_features[bill_amt_cols].std(axis=1)
+    df_features['pay_amt_avg'] = df_features[pay_amt_cols].mean(axis=1)
+
+    # 3.3. Características de Tendencia
+    # Se calcula la pendiente para observar tendencias en facturación y pagos.
+    def calculate_slope(row, cols):
+        # CORRECCIÓN: Se convierten los valores a tipo float para evitar errores de tipo.
+        y = row[cols].values.astype(float)
+        x = np.array(range(len(y)))
+        # Se ajusta un polinomio de grado 1 (una línea) y se devuelve la pendiente.
+        slope, _ = np.polyfit(x, y, 1)
+        return slope
+
+    # Se aplica la función a las columnas de interés (en orden cronológico inverso).
+    df_features['bill_amt_slope'] = df_features.apply(lambda row: calculate_slope(row, bill_amt_cols[::-1]), axis=1)
+    df_features['pay_status_slope'] = df_features.apply(lambda row: calculate_slope(row, pay_status_cols[::-1]), axis=1)
+
+    # 3.4. Indicadores de Comportamiento de Pago
+    # Se extraen características sobre el comportamiento de pago del cliente.
+    df_features['pay_status_avg'] = df_features[pay_status_cols].mean(axis=1)
+    df_features['months_with_delay'] = (df_features[pay_status_cols] > 0).sum(axis=1)
+    df_features['zero_payment_months'] = (df_features[pay_amt_cols] == 0).sum(axis=1)
+
+    print("\n--- Ingeniería de Características para Clasificación completada ---")
+    display(df_features.head())
+
+if df is not None:
+    # Se seleccionan solo las columnas numéricas para el cálculo de VIF.
+    numeric_cols_for_vif = df_features.select_dtypes(include=np.number).drop(columns=['ID', 'default_payment_next_month'])
+    
+    # Se añade una constante para el cálculo correcto del VIF.
+    X_vif = add_constant(numeric_cols_for_vif)
+    
+    vif_data = pd.DataFrame()
+    vif_data["feature"] = X_vif.columns
+    vif_data["VIF"] = [variance_inflation_factor(X_vif.values, i) for i in range(X_vif.shape[1])]
+    
+    print("\n--- Análisis de Factor de Inflación de la Varianza (VIF) ---")
+    # Se muestran las 15 variables con mayor VIF, que son las más problemáticas.
+    display(vif_data.sort_values(by='VIF', ascending=False).head(15))
+
+if df is not None:
+    features_reducidas = [
+        # Demográficas y Límite de Crédito
+        'limit_bal', 'sex', 'education', 'marriage', 'age',
+        # Comportamiento de Pago (las más predictivas)
+        'pay_sept', 'pay_status_avg', 'pay_status_slope',
+        # Salud Financiera (menos correlacionadas)
+        'utilization_sept', 'bill_amt_std', 'pay_amt_avg',
+        # Variable Objetivo
+        'default_payment_next_month'
+    ]
+    df_reducido = df_features[features_reducidas]
+    print("\n--- Dataset Reducido Creado ---")
+    display(df_reducido.head())
+
+if df is not None:
+    df_features_reg = df.copy()
+    
+    # Se usan solo datos hasta junio para evitar fuga de información.
+    bill_cols_reg = ['bill_amt_june', 'bill_amt_may', 'bill_amt_april']
+    pay_cols_reg = ['pay_amt_may', 'pay_amt_april']
+    
+    # 6.1. Ratios y Agregados
+    df_features_reg['utilization_june'] = df_features_reg['bill_amt_june'] / (df_features_reg['limit_bal'] + epsilon)
+    df_features_reg['bill_amt_avg_3m'] = df_features_reg[bill_cols_reg].mean(axis=1)
+    df_features_reg['pay_amt_avg_2m'] = df_features_reg[pay_cols_reg].mean(axis=1)
+
+    print("\n--- Ingeniería de Características para Regresión completada ---")
+
+if df is not None:
+    try:
+        processed_data_path = project_root / "data" / "processed"
+        
+        # Guardar dataset completo para clasificación
+        path_clasificacion = processed_data_path / "features_clasificacion.csv"
+        df_features.to_csv(path_clasificacion, index=False)
+        print(f"\nDataset para clasificación guardado en: {path_clasificacion}")
+
+        # Guardar dataset reducido para clasificación
+        path_reducido = processed_data_path / "features_reducido_clasificacion.csv"
+        df_reducido.to_csv(path_reducido, index=False)
+        print(f"Dataset reducido para clasificación guardado en: {path_reducido}")
+        
+        # Guardar dataset para regresión
+        path_regresion = processed_data_path / "features_regresion.csv"
+        df_features_reg.to_csv(path_regresion, index=False)
+        print(f"Dataset para regresión guardado en: {path_regresion}")
+
+    except Exception as e:
+        print(f"\nOcurrió un error al guardar los archivos: {e}")
+
